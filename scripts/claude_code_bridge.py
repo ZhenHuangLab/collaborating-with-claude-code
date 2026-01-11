@@ -215,7 +215,7 @@ def main() -> None:
         ),
     )
     parser.add_argument("--return-all-messages", action="store_true", help="Return the full streamed JSON event list from Claude Code.")
-    parser.add_argument("--timeout-s", type=float, default=600.0, help="Process timeout in seconds. Defaults to 600.")
+    parser.add_argument("--timeout-s", type=float, default=1200.0, help="Process timeout in seconds. Defaults to 1200 (20 minutes).")
     parser.add_argument("--claude-bin", default="claude", help="Claude Code executable name/path. Defaults to `claude`.")
 
     args = parser.parse_args()

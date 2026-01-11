@@ -52,7 +52,7 @@ python scripts/claude_code_bridge.py --cd "/repo" --SESSION_ID "abc123" --PROMPT
 - `--tools` (optional): Defaults to `default` (all tools) when full access; defaults to `Read,Glob,Grep,LS` when no full access.
 - `--allowedTools` (optional): Defaults to `*` (allow all tools without prompts) when full access; defaults to `Read,Glob,Grep,LS` when no full access.
 - `--return-all-messages` (optional): Return the full streamed JSON event list from Claude Code (useful for debugging).
-- `--timeout-s` (optional): Defaults to 600 seconds.
+- `--timeout-s` (optional): Defaults to 1200 seconds (20 minutes).
 
 ## Output format
 
