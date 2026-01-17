@@ -1,6 +1,8 @@
 # collaborating-with-claude-code
 
-一个用于 **Codex CLI skills** 的小工具：通过一个 JSON bridge 脚本，把“代码审查 / 调试 / 方案对比”等任务委托给 **Anthropic Claude Code CLI**（默认模型：`claude-opus-4-5-20251101`），并以结构化 JSON 结果返回，便于在多模型协作中使用。
+中文 | [English](README_EN.md)
+
+**Codex CLI** 的一个 skill ：通过一个 JSON bridge 脚本，把“代码审查 / 调试 / 方案对比”等任务委托给 **Anthropic Claude Code CLI**（默认模型：`claude-opus-4-5-20251101`），并以结构化 JSON 结果返回，便于在多模型协作中使用。
 
 本仓库的核心入口是 `SKILL.md`（Codex skill 定义）以及 `scripts/claude_code_bridge.py`（桥接脚本）。
 
@@ -64,4 +66,3 @@ When collaborating with Claude Code:
 ## License
 
 MIT License，详见 `LICENSE`。
-
