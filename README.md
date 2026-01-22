@@ -81,6 +81,10 @@ When collaborating with Claude Code:
 - When claude code asks clarifying questions in a multi-turn session, always respond to its questions in that session based on current situation.
 ```
 
+## 兼容性
+
+已经在codex v0.87, claude code v2.1.11 and v2.1.12 测试通过.
+
 ## License
 
 MIT License，详见 `LICENSE`。
