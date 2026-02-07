@@ -336,18 +336,52 @@ def _run(cmd: List[str], timeout_s: Optional[float], cwd: Optional[Path]) -> Tup
 def _parse_single_json(stdout: str) -> Dict[str, Any]:
     """
     Claude Code should emit a single JSON object in `--output-format json`.
-    Be tolerant of extra non-JSON lines by extracting the first {...} block.
+    Be tolerant of extra non-JSON lines and environments that (sometimes)
+    return a JSON array of events instead of a single object.
     """
     stdout = stdout.strip()
     if not stdout:
         raise ValueError("Empty stdout")
+
+    def to_payload(obj: Any) -> Dict[str, Any]:
+        if isinstance(obj, dict):
+            return obj
+
+        if isinstance(obj, list):
+            session_id: Optional[str] = None
+            last_result: Optional[Dict[str, Any]] = None
+            for item in obj:
+                if not isinstance(item, dict):
+                    continue
+                if not session_id and item.get("session_id"):
+                    session_id = item.get("session_id")
+                if item.get("type") == "result":
+                    last_result = item
+            payload: Dict[str, Any] = (
+                last_result
+                if isinstance(last_result, dict)
+                else {"type": "result", "subtype": "incomplete_output", "is_error": True, "result": ""}
+            )
+            if session_id and not payload.get("session_id"):
+                payload["session_id"] = session_id
+            return payload
+
+        return {"type": "result", "subtype": "invalid_output", "is_error": True, "result": str(obj)}
+
     try:
-        return json.loads(stdout)
+        return to_payload(json.loads(stdout))
     except json.JSONDecodeError:
-        start = stdout.find("{")
-        end = stdout.rfind("}")
-        if start != -1 and end != -1 and end > start:
-            return json.loads(stdout[start : end + 1])
+        start_obj = stdout.find("{")
+        start_arr = stdout.find("[")
+        candidates = [i for i in (start_obj, start_arr) if i != -1]
+        start = min(candidates) if candidates else -1
+        if start == -1:
+            raise
+
+        end_char = "}" if stdout[start] == "{" else "]"
+        end = stdout.rfind(end_char)
+        if end != -1 and end > start:
+            return to_payload(json.loads(stdout[start : end + 1]))
         raise
 
 
@@ -358,7 +392,13 @@ def _parse_stream_json(stdout: str) -> List[Dict[str, Any]]:
         if not line:
             continue
         try:
-            messages.append(json.loads(line))
+            parsed = json.loads(line)
+            if isinstance(parsed, dict):
+                messages.append(parsed)
+            elif isinstance(parsed, list):
+                messages.extend([item for item in parsed if isinstance(item, dict)])
+            else:
+                messages.append({"type": "non_json_line", "text": raw_line})
         except json.JSONDecodeError:
             messages.append({"type": "non_json_line", "text": raw_line})
     return messages
