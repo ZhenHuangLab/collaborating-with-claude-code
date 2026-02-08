@@ -10,9 +10,11 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import signal
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -30,6 +32,140 @@ CLAUDE_STEP_MAX_TURNS = 1
 CLAUDE_CONNECTIVITY_ERROR_MESSAGE = "Failed to connect to Claude. Is Claude installed and on PATH?"
 CLAUDE_VERSION_CHECK_TIMEOUT_S = 5.0
 DEFAULT_STATUS_INTERVAL_S = 30.0
+PIPE_DRAIN_GRACE_S = 2.0
+TERMINATE_GRACE_S = 5.0
+EARLY_PARSE_INTERVAL_S = 1.0
+EARLY_PARSE_QUIET_S = 0.5
+
+
+def _kill_process_tree(process: subprocess.Popen[Any], *, force: bool) -> None:
+    """
+    Best-effort termination of the subprocess (and any children holding stdio open).
+
+    Why this exists:
+    - Claude Code (a Node CLI) may spawn child processes that inherit stdout/stderr.
+      If those children keep the pipe open, `communicate()` can block forever even
+      after the parent exits.
+    - On POSIX we run the CLI in a new session so we can kill the whole process group.
+    - On Windows we fall back to `taskkill /T` when available.
+    """
+    pid = getattr(process, "pid", None)
+    if not pid:
+        return
+
+    if os.name != "nt":
+        sig = signal.SIGKILL if force else signal.SIGTERM
+        try:
+            os.killpg(pid, sig)
+            return
+        except ProcessLookupError:
+            return
+        except Exception:
+            pass
+
+        try:
+            process.kill() if force else process.terminate()
+        except Exception:
+            pass
+        return
+
+    taskkill = shutil.which("taskkill")
+    if taskkill:
+        cmd = [taskkill]
+        if force:
+            cmd.append("/F")
+        cmd.extend(["/PID", str(pid), "/T"])
+        try:
+            subprocess.run(
+                cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+            return
+        except Exception:
+            pass
+
+    try:
+        process.kill()
+    except Exception:
+        pass
+
+
+def _has_result_event(obj: Any) -> bool:
+    """Return True if a parsed JSON output contains a terminal Claude `result` event."""
+    if isinstance(obj, dict):
+        return obj.get("type") == "result"
+    if isinstance(obj, list):
+        for item in obj:
+            if isinstance(item, dict) and item.get("type") == "result":
+                return True
+    return False
+
+
+def _try_parse_json_value(text: str) -> Optional[Any]:
+    """
+    Best-effort parse of a JSON value from a (mostly) JSON stdout string.
+
+    Claude Code `--output-format json` should emit a single JSON value. In some
+    environments it may be surrounded by extra non-JSON lines; this helper
+    tolerates that by extracting the outermost {...} or [...] region.
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return None
+
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        start_obj = raw.find("{")
+        start_arr = raw.find("[")
+        candidates = [i for i in (start_obj, start_arr) if i != -1]
+        start = min(candidates) if candidates else -1
+        if start == -1:
+            return None
+
+        end_char = "}" if raw[start] == "{" else "]"
+        end = raw.rfind(end_char)
+        if end == -1 or end <= start:
+            return None
+
+        try:
+            return json.loads(raw[start : end + 1])
+        except json.JSONDecodeError:
+            return None
+
+
+class _OutputBuffer:
+    """Thread-safe output accumulator with a small tail cache for quick heuristics."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._chunks: List[str] = []
+        self._tail: str = ""
+        self._last_change_ts = time.monotonic()
+
+    def append(self, chunk: str) -> None:
+        if not chunk:
+            return
+        now = time.monotonic()
+        with self._lock:
+            self._chunks.append(chunk)
+            self._tail = (self._tail + chunk)[-4096:]
+            self._last_change_ts = now
+
+    def snapshot(self) -> str:
+        with self._lock:
+            return "".join(self._chunks)
+
+    def tail(self) -> str:
+        with self._lock:
+            return self._tail
+
+    def last_change_ts(self) -> float:
+        with self._lock:
+            return float(self._last_change_ts)
 
 
 def _parse_settings_arg(settings_arg: str) -> Dict[str, Any]:
@@ -322,6 +458,14 @@ def _run(
     cmd = cmd.copy()
     cmd[0] = _resolve_executable(cmd[0], env)
 
+    popen_kwargs: Dict[str, Any] = {}
+    # On POSIX, isolate Claude in its own session so we can kill the whole process
+    # group if it (or a child) keeps stdout/stderr open and blocks draining.
+    if os.name != "nt":
+        popen_kwargs["start_new_session"] = True
+    elif hasattr(subprocess, "CREATE_NEW_PROCESS_GROUP"):
+        popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+
     process = subprocess.Popen(
         cmd,
         stdin=subprocess.DEVNULL,
@@ -332,35 +476,124 @@ def _run(
         errors="replace",
         env=env,
         cwd=str(cwd) if cwd is not None else None,
+        **popen_kwargs,
     )
+
+    stdout_buf = _OutputBuffer()
+    stderr_buf = _OutputBuffer()
+
+    def drain(stream: Any, sink: _OutputBuffer) -> None:
+        if stream is None:
+            return
+        try:
+            while True:
+                chunk = stream.readline()
+                if chunk == "":
+                    break
+                sink.append(chunk)
+        except Exception as error:  # noqa: BLE001 - keep bridge resilient
+            sink.append(f"\n[bridge] stream read error: {error}\n")
+        finally:
+            try:
+                stream.close()
+            except Exception:
+                pass
+
+    t_out = threading.Thread(target=drain, args=(process.stdout, stdout_buf), daemon=True)
+    t_err = threading.Thread(target=drain, args=(process.stderr, stderr_buf), daemon=True)
+    t_out.start()
+    t_err.start()
+
     heartbeat_interval: Optional[float] = None
     if heartbeat_interval_s is not None and heartbeat_interval_s > 0:
         heartbeat_interval = float(heartbeat_interval_s)
 
-    deadline = (time.monotonic() + timeout_s) if timeout_s is not None else None
+    deadline = (time.monotonic() + float(timeout_s)) if timeout_s is not None else None
+    last_heartbeat_ts = time.monotonic()
+    last_parse_attempt_ts = 0.0
+    timed_out = False
+    completed_early = False
+
+    output_format: Optional[str] = None
+    try:
+        fmt_index = cmd.index("--output-format")
+        if fmt_index + 1 < len(cmd):
+            output_format = cmd[fmt_index + 1]
+    except ValueError:
+        output_format = None
 
     try:
         while True:
-            wait_timeout: Optional[float]
-            if deadline is None:
-                wait_timeout = heartbeat_interval
-            else:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise subprocess.TimeoutExpired(cmd=cmd, timeout=timeout_s)
-                wait_timeout = min(remaining, heartbeat_interval) if heartbeat_interval is not None else remaining
+            if process.poll() is not None:
+                break
 
+            now = time.monotonic()
+            if deadline is not None and now >= deadline:
+                timed_out = True
+                break
+
+            if output_format == "json":
+                quiet_for_s = now - stdout_buf.last_change_ts()
+                tail_stripped = stdout_buf.tail().strip()
+                should_try_parse = bool(
+                    (now - last_parse_attempt_ts) >= EARLY_PARSE_INTERVAL_S
+                    and (quiet_for_s >= EARLY_PARSE_QUIET_S or tail_stripped.endswith(("}", "]")))
+                )
+                if should_try_parse:
+                    last_parse_attempt_ts = now
+                    parsed = _try_parse_json_value(stdout_buf.snapshot())
+                    if parsed is not None and _has_result_event(parsed):
+                        completed_early = True
+                        break
+
+            if (
+                heartbeat_callback is not None
+                and heartbeat_interval is not None
+                and (now - last_heartbeat_ts) >= heartbeat_interval
+            ):
+                heartbeat_callback()
+                last_heartbeat_ts = now
+
+            time.sleep(0.2)
+    finally:
+        if timed_out or completed_early:
+            _kill_process_tree(process, force=False)
             try:
-                stdout, stderr = process.communicate(timeout=wait_timeout)
-                return process.returncode, stdout, stderr
+                process.wait(timeout=TERMINATE_GRACE_S)
             except subprocess.TimeoutExpired:
-                if heartbeat_callback is not None and heartbeat_interval is not None:
-                    heartbeat_callback()
-                continue
-    except subprocess.TimeoutExpired:
-        process.kill()
-        stdout, stderr = process.communicate()
-        return 124, stdout, (stderr + "\n[timeout] Claude Code process timed out.").strip()
+                _kill_process_tree(process, force=True)
+                try:
+                    process.wait(timeout=TERMINATE_GRACE_S)
+                except subprocess.TimeoutExpired:
+                    pass
+
+        # If the parent exited but a child kept stdio open, drain threads can
+        # stay blocked. Give them a short grace period, then kill the tree.
+        t_out.join(timeout=PIPE_DRAIN_GRACE_S)
+        t_err.join(timeout=PIPE_DRAIN_GRACE_S)
+        if t_out.is_alive() or t_err.is_alive():
+            _kill_process_tree(process, force=True)
+            try:
+                if process.stdout is not None:
+                    process.stdout.close()
+                if process.stderr is not None:
+                    process.stderr.close()
+            except Exception:
+                pass
+            t_out.join(timeout=PIPE_DRAIN_GRACE_S)
+            t_err.join(timeout=PIPE_DRAIN_GRACE_S)
+
+    stdout = stdout_buf.snapshot()
+    stderr = stderr_buf.snapshot()
+
+    if timed_out:
+        stderr = (stderr + "\n[timeout] Claude Code process timed out.").strip()
+        return 124, stdout, stderr
+
+    if completed_early:
+        return 0, stdout, stderr
+
+    return int(process.returncode or 0), stdout, stderr
 
 
 def _parse_single_json(stdout: str) -> Dict[str, Any]:
