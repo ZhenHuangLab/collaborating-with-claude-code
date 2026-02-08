@@ -13,8 +13,9 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 
 DEFAULT_MODEL = "claude-opus-4-5-20251101"
@@ -28,6 +29,7 @@ DEFAULT_STEP_CONTINUE_PROMPT = "Continue from where you left off. Do not restate
 CLAUDE_STEP_MAX_TURNS = 1
 CLAUDE_CONNECTIVITY_ERROR_MESSAGE = "Failed to connect to Claude. Is Claude installed and on PATH?"
 CLAUDE_VERSION_CHECK_TIMEOUT_S = 5.0
+DEFAULT_STATUS_INTERVAL_S = 30.0
 
 
 def _parse_settings_arg(settings_arg: str) -> Dict[str, Any]:
@@ -307,7 +309,14 @@ def _configure_windows_stdio() -> None:
                 pass
 
 
-def _run(cmd: List[str], timeout_s: Optional[float], cwd: Optional[Path]) -> Tuple[int, str, str]:
+def _run(
+    cmd: List[str],
+    timeout_s: Optional[float],
+    cwd: Optional[Path],
+    *,
+    heartbeat_interval_s: Optional[float] = None,
+    heartbeat_callback: Optional[Callable[[], None]] = None,
+) -> Tuple[int, str, str]:
     env = os.environ.copy()
     _augment_path_env(env)
     cmd = cmd.copy()
@@ -324,13 +333,34 @@ def _run(cmd: List[str], timeout_s: Optional[float], cwd: Optional[Path]) -> Tup
         env=env,
         cwd=str(cwd) if cwd is not None else None,
     )
+    heartbeat_interval: Optional[float] = None
+    if heartbeat_interval_s is not None and heartbeat_interval_s > 0:
+        heartbeat_interval = float(heartbeat_interval_s)
+
+    deadline = (time.monotonic() + timeout_s) if timeout_s is not None else None
+
     try:
-        stdout, stderr = process.communicate(timeout=timeout_s)
+        while True:
+            wait_timeout: Optional[float]
+            if deadline is None:
+                wait_timeout = heartbeat_interval
+            else:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(cmd=cmd, timeout=timeout_s)
+                wait_timeout = min(remaining, heartbeat_interval) if heartbeat_interval is not None else remaining
+
+            try:
+                stdout, stderr = process.communicate(timeout=wait_timeout)
+                return process.returncode, stdout, stderr
+            except subprocess.TimeoutExpired:
+                if heartbeat_callback is not None and heartbeat_interval is not None:
+                    heartbeat_callback()
+                continue
     except subprocess.TimeoutExpired:
         process.kill()
         stdout, stderr = process.communicate()
         return 124, stdout, (stderr + "\n[timeout] Claude Code process timed out.").strip()
-    return process.returncode, stdout, stderr
 
 
 def _parse_single_json(stdout: str) -> Dict[str, Any]:
@@ -555,8 +585,50 @@ def main() -> None:
     advanced.add_argument("--return-all-messages", action="store_true", help="Return the full streamed JSON event list (debugging).")
     advanced.add_argument("--timeout-s", type=float, default=1800.0, help="Timeout in seconds (default: 30 minutes).")
     advanced.add_argument("--claude-bin", default="claude", help="Claude Code executable name/path (default: `claude`).")
+    advanced.add_argument(
+        "--quiet-status",
+        action="store_true",
+        help="Disable minimal runtime status lines on stderr (`working...`, `session_id=...`, `done`).",
+    )
+    advanced.add_argument(
+        "--status-interval-s",
+        type=float,
+        default=DEFAULT_STATUS_INTERVAL_S,
+        help=f"Status heartbeat interval in seconds (default: {DEFAULT_STATUS_INTERVAL_S:g}).",
+    )
 
     args = parser.parse_args()
+
+    status_enabled = not bool(args.quiet_status)
+    status_interval_s = float(args.status_interval_s)
+    if status_interval_s <= 0:
+        status_interval_s = DEFAULT_STATUS_INTERVAL_S
+    last_status_ts = 0.0
+    emitted_session_id: Optional[str] = None
+
+    def emit_working(*, force: bool = False) -> None:
+        nonlocal last_status_ts
+        if not status_enabled:
+            return
+        now = time.monotonic()
+        if not force and (now - last_status_ts) < status_interval_s:
+            return
+        print("working...", file=sys.stderr, flush=True)
+        last_status_ts = now
+
+    def emit_session_id(session_id: Optional[str]) -> None:
+        nonlocal emitted_session_id
+        if not status_enabled or not session_id:
+            return
+        if session_id == emitted_session_id:
+            return
+        print(f"session_id={session_id}", file=sys.stderr, flush=True)
+        emitted_session_id = session_id
+
+    def emit_done() -> None:
+        if not status_enabled:
+            return
+        print("done", file=sys.stderr, flush=True)
 
     cd_path = Path(args.cd).expanduser()
     if not cd_path.is_dir():
@@ -616,9 +688,16 @@ def main() -> None:
             max_turns=max_turns,
             verbose=verbose,
         )
-        return _run(cmd, timeout_s=args.timeout_s, cwd=cd_path)
+        return _run(
+            cmd,
+            timeout_s=args.timeout_s,
+            cwd=cd_path,
+            heartbeat_interval_s=status_interval_s if status_enabled else None,
+            heartbeat_callback=emit_working if status_enabled else None,
+        )
 
     def print_exec_error(error: Exception) -> None:
+        emit_done()
         print(
             json.dumps(
                 {"success": False, "error": f"Failed to execute Claude Code CLI. Is `claude` installed and on PATH?\n\n{error}"},
@@ -711,6 +790,7 @@ def main() -> None:
                 extracted = _extract_session_id(stdout0, stderr0)
                 if extracted and not session_id:
                     session_id = extracted
+            emit_session_id(session_id)
 
             # If we still don't have a session id (and the user didn't provide one), prefer continuing the
             # most recent conversation in this directory instead of starting a brand new session.
@@ -736,6 +816,7 @@ def main() -> None:
                 session_id = summary.get("session_id") or session_id
                 if session_id:
                     continue_session = False
+                emit_session_id(session_id)
                 subtype = summary.get("subtype")
                 is_error = bool(summary.get("is_error"))
                 result_text = summary.get("result_text") or ""
@@ -763,12 +844,16 @@ def main() -> None:
         # Exceeded max steps.
         return 1, "", f"Step mode exceeded --step-max-steps={args.step_max_steps} without reaching a final result."
 
+    emit_working(force=True)
+    emit_session_id(args.SESSION_ID or None)
+
     rc, stdout, stderr = run_with_optional_stepping()
 
     try:
         if output_format == "json":
             payload = _parse_single_json(stdout)
             session_id = payload.get("session_id")
+            emit_session_id(session_id)
             result_text = payload.get("result")
             subtype = payload.get("subtype")
             is_error = bool(payload.get("is_error"))
@@ -804,6 +889,7 @@ def main() -> None:
         else:
             messages = _parse_stream_json(stdout)
             session_id, result_text, error_text = _extract_result(messages)
+            emit_session_id(session_id)
             last_result: Optional[Dict[str, Any]] = next(
                 (msg for msg in reversed(messages) if isinstance(msg, dict) and msg.get("type") == "result"),
                 None,
@@ -839,6 +925,7 @@ def main() -> None:
 
     except Exception as error:  # noqa: BLE001 - keep bridge resilient
         extracted_session_id = _extract_session_id(stdout, stderr)
+        emit_session_id(extracted_session_id)
         result = {
             "success": False,
             "error": f"Bridge failed to parse Claude Code output: {error}\n\n[stderr]\n{stderr.strip()}\n\n[stdout]\n{stdout.strip()}".strip(),
@@ -846,6 +933,7 @@ def main() -> None:
         if extracted_session_id:
             result["SESSION_ID"] = extracted_session_id
 
+    emit_done()
     print(json.dumps(result, indent=2, ensure_ascii=False))
 
 

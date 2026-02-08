@@ -69,6 +69,13 @@ python <script_loc> --no-full-access --cd "/path/to/repo" --PROMPT "Review the a
 
 更完整的参数说明与多轮会话用法见 `SKILL.md`。
 
+## 运行状态输出（stderr）
+
+- 脚本运行过程中，默认会向 `stderr` 输出极简状态：`working...`、`session_id=...`、`done`。
+- 最终结构化结果仍只输出到 `stdout`（JSON 不会被状态文本污染）。
+- 如需关闭状态输出：`--quiet-status`
+- 如需调整心跳频率：`--status-interval-s 30`
+
 ## 兼容性
 
 已经在codex v0.87, claude code v2.1.11 and v2.1.12 测试通过.

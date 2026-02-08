@@ -69,6 +69,13 @@ python <script_loc> --no-full-access --cd "/path/to/repo" --PROMPT "Review the a
 
 For a more complete parameter reference and multi-turn session usage, see `SKILL.md`.
 
+## Runtime status output (`stderr`)
+
+- While the bridge is running, it emits minimal status lines to `stderr` by default: `working...`, `session_id=...`, `done`.
+- The final structured result stays on `stdout` only (JSON is not mixed with status text).
+- Disable status lines with `--quiet-status`.
+- Adjust heartbeat interval with `--status-interval-s 30`.
+
 ## Compatibility
 
 Tested on codex v0.87, claude code v2.1.11 and v2.1.12.
