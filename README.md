@@ -71,10 +71,9 @@ python <script_loc> --no-full-access --cd "/path/to/repo" --PROMPT "Review the a
 
 ## 运行状态输出（stderr）
 
-- 脚本运行过程中，默认会向 `stderr` 输出极简状态：`working...`、`session_id=...`、`done`。
-- 最终结构化结果仍只输出到 `stdout`（JSON 不会被状态文本污染）。
-- 如需关闭状态输出：`--quiet-status`
-- 如需调整心跳频率：`--status-interval-s 30`
+- 脚本运行过程中，默认会将 Claude 的 assistant 文本实时输出到 `stderr`（便于看进度），并输出一次 `session_id=...`。
+- 最终结构化结果仍只输出到 `stdout`（JSON 不会被 `stderr` 输出污染）。
+- 如需关闭所有 `stderr` 输出：`--quiet`
 
 ## 兼容性
 

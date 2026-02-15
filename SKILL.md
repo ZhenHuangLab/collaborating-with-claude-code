@@ -16,8 +16,7 @@ The script is located at `~/.codex/skills/collaborating-with-claude-code/scripts
 Claude Code often needs **1–2+ minutes** per task.
 - Prefer running the bridge directly (no `&`); increase `--timeout-s` as needed (default: 1800s).
 - Do **NOT** redirect stdout to a file (e.g. `> /tmp/out.json`).
-- By default, the bridge prints minimal runtime status to `stderr`: `working...`, `session_id=...`, `done`.
-- Disable status lines with `--quiet-status`; adjust heartbeat interval with `--status-interval-s`.
+- By default, the bridge streams Claude's assistant text to `stderr`, and prints only the final JSON envelope to `stdout`.
 
 ## Context
 
@@ -35,14 +34,14 @@ Claude Code often needs **1–2+ minutes** per task.
 
 - **full access** (`--full-access`): use only in trusted repos/directories.
 - **extended thinking ON** (can disable via `--no-extended-thinking`).
-- **step mode ON** (can disable via `--step-mode off`).
+- **step mode AUTO** (can disable via `--step-mode off`).
 
 ## Output format
 
 The bridge prints JSON to `stdout`:
 
 ```json
-{"success": true, "SESSION_ID": "abc123", "agent_messages": "…Claude output…", "all_messages": []}
+{"success": true, "SESSION_ID": "abc123", "agent_messages": "…Claude output…"}
 ```
 
 ## Recommended delegation patterns

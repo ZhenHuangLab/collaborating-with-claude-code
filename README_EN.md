@@ -71,10 +71,9 @@ For a more complete parameter reference and multi-turn session usage, see `SKILL
 
 ## Runtime status output (`stderr`)
 
-- While the bridge is running, it emits minimal status lines to `stderr` by default: `working...`, `session_id=...`, `done`.
-- The final structured result stays on `stdout` only (JSON is not mixed with status text).
-- Disable status lines with `--quiet-status`.
-- Adjust heartbeat interval with `--status-interval-s 30`.
+- While the bridge is running, it streams Claude assistant text to `stderr` by default (so you can see progress), and prints `session_id=...` once.
+- The final structured result stays on `stdout` only (JSON is not mixed with `stderr` output).
+- Disable all `stderr` output with `--quiet`.
 
 ## Compatibility
 

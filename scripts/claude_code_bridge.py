@@ -32,11 +32,8 @@ DEFAULT_STEP_CONTINUE_PROMPT = "Continue from where you left off. Do not restate
 CLAUDE_STEP_MAX_TURNS = 1
 CLAUDE_CONNECTIVITY_ERROR_MESSAGE = "Failed to connect to Claude. Is Claude installed and on PATH?"
 CLAUDE_VERSION_CHECK_TIMEOUT_S = 5.0
-DEFAULT_STATUS_INTERVAL_S = 30.0
 PIPE_DRAIN_GRACE_S = 2.0
 TERMINATE_GRACE_S = 5.0
-EARLY_PARSE_INTERVAL_S = 1.0
-EARLY_PARSE_QUIET_S = 0.5
 IO_READ_CHUNK_SIZE = 8192
 
 
@@ -93,50 +90,6 @@ def _kill_process_tree(process: subprocess.Popen[Any], *, force: bool) -> None:
         process.kill()
     except Exception:
         pass
-
-
-def _has_result_event(obj: Any) -> bool:
-    """Return True if a parsed JSON output contains a terminal Claude `result` event."""
-    if isinstance(obj, dict):
-        return obj.get("type") == "result"
-    if isinstance(obj, list):
-        for item in obj:
-            if isinstance(item, dict) and item.get("type") == "result":
-                return True
-    return False
-
-
-def _try_parse_json_value(text: str) -> Optional[Any]:
-    """
-    Best-effort parse of a JSON value from a (mostly) JSON stdout string.
-
-    Claude Code `--output-format json` should emit a single JSON value. In some
-    environments it may be surrounded by extra non-JSON lines; this helper
-    tolerates that by extracting the outermost {...} or [...] region.
-    """
-    raw = (text or "").strip()
-    if not raw:
-        return None
-
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        start_obj = raw.find("{")
-        start_arr = raw.find("[")
-        candidates = [i for i in (start_obj, start_arr) if i != -1]
-        start = min(candidates) if candidates else -1
-        if start == -1:
-            return None
-
-        end_char = "}" if raw[start] == "{" else "]"
-        end = raw.rfind(end_char)
-        if end == -1 or end <= start:
-            return None
-
-        try:
-            return json.loads(raw[start : end + 1])
-        except json.JSONDecodeError:
-            return None
 
 
 class _OutputBuffer:
@@ -447,18 +400,83 @@ def _configure_windows_stdio() -> None:
                 pass
 
 
+def _drain_stream_json_lines(
+    buffer: str,
+    decoded: str,
+    *,
+    stream_json_event_callback: Optional[Callable[[Dict[str, Any]], None]],
+    result_seen: threading.Event,
+    final: bool = False,
+) -> str:
+    """
+    Incrementally parse Claude Code `--output-format stream-json` stdout.
+
+    Returns the remaining (incomplete) line buffer after parsing complete lines.
+    """
+    buffer = (buffer or "") + (decoded or "")
+
+    def handle_parsed(obj: Any) -> None:
+        events: List[Dict[str, Any]] = []
+        if isinstance(obj, dict):
+            events = [obj]
+        elif isinstance(obj, list):
+            events = [item for item in obj if isinstance(item, dict)]
+
+        for event in events:
+            if stream_json_event_callback is not None:
+                try:
+                    stream_json_event_callback(event)
+                except Exception:
+                    # Never allow streaming UI to break the bridge.
+                    pass
+            if event.get("type") == "result":
+                result_seen.set()
+
+    while True:
+        if "\n" not in buffer:
+            break
+        line, buffer = buffer.split("\n", 1)
+        raw = line.strip()
+        if not raw:
+            continue
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        handle_parsed(parsed)
+
+    if final:
+        raw = buffer.strip()
+        if raw:
+            try:
+                parsed = json.loads(raw)
+            except json.JSONDecodeError:
+                return ""
+            handle_parsed(parsed)
+        return ""
+
+    return buffer
+
+
 def _run(
     cmd: List[str],
     timeout_s: Optional[float],
     cwd: Optional[Path],
     *,
-    heartbeat_interval_s: Optional[float] = None,
-    heartbeat_callback: Optional[Callable[[], None]] = None,
+    stream_json_event_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> Tuple[int, str, str]:
     env = os.environ.copy()
     _augment_path_env(env)
     cmd = cmd.copy()
     cmd[0] = _resolve_executable(cmd[0], env)
+
+    output_format: Optional[str] = None
+    try:
+        fmt_index = cmd.index("--output-format")
+        if fmt_index + 1 < len(cmd):
+            output_format = cmd[fmt_index + 1]
+    except ValueError:
+        output_format = None
 
     popen_kwargs: Dict[str, Any] = {}
     # On POSIX, isolate Claude in its own session so we can kill the whole process
@@ -480,56 +498,70 @@ def _run(
 
     stdout_buf = _OutputBuffer()
     stderr_buf = _OutputBuffer()
+    stream_json_result_seen = threading.Event()
 
-    def drain(stream: Any, sink: _OutputBuffer) -> None:
+    def drain(stream: Any, sink: _OutputBuffer, *, is_stdout: bool) -> None:
         if stream is None:
             return
         decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        line_buf = ""
         try:
             while True:
                 chunk = stream.read(IO_READ_CHUNK_SIZE)
                 if not chunk:
                     break
                 if isinstance(chunk, str):
-                    sink.append(chunk)
+                    decoded = chunk
                 else:
-                    sink.append(decoder.decode(chunk))
+                    decoded = decoder.decode(chunk)
+                sink.append(decoded)
+
+                if is_stdout and output_format == "stream-json":
+                    line_buf = _drain_stream_json_lines(
+                        line_buf,
+                        decoded,
+                        stream_json_event_callback=stream_json_event_callback,
+                        result_seen=stream_json_result_seen,
+                    )
         except Exception as error:  # noqa: BLE001 - keep bridge resilient
             sink.append(f"\n[bridge] stream read error: {error}\n")
         finally:
             try:
-                sink.append(decoder.decode(b"", final=True))
+                final_decoded = decoder.decode(b"", final=True)
+                if final_decoded:
+                    sink.append(final_decoded)
+                    if is_stdout and output_format == "stream-json":
+                        line_buf = _drain_stream_json_lines(
+                            line_buf,
+                            final_decoded,
+                            stream_json_event_callback=stream_json_event_callback,
+                            result_seen=stream_json_result_seen,
+                        )
             except Exception:
                 pass
+            if is_stdout and output_format == "stream-json":
+                _drain_stream_json_lines(
+                    line_buf,
+                    "",
+                    stream_json_event_callback=stream_json_event_callback,
+                    result_seen=stream_json_result_seen,
+                    final=True,
+                )
             try:
                 stream.close()
             except Exception:
                 pass
 
-    t_out = threading.Thread(target=drain, args=(process.stdout, stdout_buf), daemon=True)
-    t_err = threading.Thread(target=drain, args=(process.stderr, stderr_buf), daemon=True)
+    t_out = threading.Thread(target=drain, args=(process.stdout, stdout_buf), kwargs={"is_stdout": True}, daemon=True)
+    t_err = threading.Thread(target=drain, args=(process.stderr, stderr_buf), kwargs={"is_stdout": False}, daemon=True)
     t_out.start()
     t_err.start()
 
-    heartbeat_interval: Optional[float] = None
-    if heartbeat_interval_s is not None and heartbeat_interval_s > 0:
-        heartbeat_interval = float(heartbeat_interval_s)
-
     deadline = (time.monotonic() + float(timeout_s)) if timeout_s is not None else None
-    last_heartbeat_ts = time.monotonic()
-    last_parse_attempt_ts = 0.0
     timed_out = False
     completed_early = False
     completed_stdout: Optional[str] = None
     completed_stderr: Optional[str] = None
-
-    output_format: Optional[str] = None
-    try:
-        fmt_index = cmd.index("--output-format")
-        if fmt_index + 1 < len(cmd):
-            output_format = cmd[fmt_index + 1]
-    except ValueError:
-        output_format = None
 
     try:
         while True:
@@ -538,34 +570,15 @@ def _run(
                 timed_out = True
                 break
 
-            if output_format == "json":
-                quiet_for_s = now - stdout_buf.last_change_ts()
-                tail_stripped = stdout_buf.tail().strip()
-                should_try_parse = bool(
-                    (now - last_parse_attempt_ts) >= EARLY_PARSE_INTERVAL_S
-                    and (quiet_for_s >= EARLY_PARSE_QUIET_S or tail_stripped.endswith(("}", "]")))
-                )
-                if should_try_parse:
-                    last_parse_attempt_ts = now
-                    parsed_stdout = stdout_buf.snapshot()
-                    parsed = _try_parse_json_value(parsed_stdout)
-                    if parsed is not None and _has_result_event(parsed):
-                        completed_early = True
-                        completed_stdout = parsed_stdout
-                        completed_stderr = stderr_buf.snapshot()
-                        break
+            if output_format == "stream-json" and stream_json_result_seen.is_set():
+                completed_early = True
+                completed_stdout = stdout_buf.snapshot()
+                completed_stderr = stderr_buf.snapshot()
+                break
 
             process_exited = process.poll() is not None
             if process_exited and (not t_out.is_alive()) and (not t_err.is_alive()):
                 break
-
-            if (
-                heartbeat_callback is not None
-                and heartbeat_interval is not None
-                and (now - last_heartbeat_ts) >= heartbeat_interval
-            ):
-                heartbeat_callback()
-                last_heartbeat_ts = now
 
             time.sleep(0.2)
     finally:
@@ -615,58 +628,6 @@ def _run(
     return int(process.returncode or 0), stdout, stderr
 
 
-def _parse_single_json(stdout: str) -> Dict[str, Any]:
-    """
-    Claude Code should emit a single JSON object in `--output-format json`.
-    Be tolerant of extra non-JSON lines and environments that (sometimes)
-    return a JSON array of events instead of a single object.
-    """
-    stdout = stdout.strip()
-    if not stdout:
-        raise ValueError("Empty stdout")
-
-    def to_payload(obj: Any) -> Dict[str, Any]:
-        if isinstance(obj, dict):
-            return obj
-
-        if isinstance(obj, list):
-            session_id: Optional[str] = None
-            last_result: Optional[Dict[str, Any]] = None
-            for item in obj:
-                if not isinstance(item, dict):
-                    continue
-                if not session_id and item.get("session_id"):
-                    session_id = item.get("session_id")
-                if item.get("type") == "result":
-                    last_result = item
-            payload: Dict[str, Any] = (
-                last_result
-                if isinstance(last_result, dict)
-                else {"type": "result", "subtype": "incomplete_output", "is_error": True, "result": ""}
-            )
-            if session_id and not payload.get("session_id"):
-                payload["session_id"] = session_id
-            return payload
-
-        return {"type": "result", "subtype": "invalid_output", "is_error": True, "result": str(obj)}
-
-    try:
-        return to_payload(json.loads(stdout))
-    except json.JSONDecodeError:
-        start_obj = stdout.find("{")
-        start_arr = stdout.find("[")
-        candidates = [i for i in (start_obj, start_arr) if i != -1]
-        start = min(candidates) if candidates else -1
-        if start == -1:
-            raise
-
-        end_char = "}" if stdout[start] == "{" else "]"
-        end = stdout.rfind(end_char)
-        if end != -1 and end > start:
-            return to_payload(json.loads(stdout[start : end + 1]))
-        raise
-
-
 def _parse_stream_json(stdout: str) -> List[Dict[str, Any]]:
     messages: List[Dict[str, Any]] = []
     for raw_line in stdout.splitlines():
@@ -684,6 +645,31 @@ def _parse_stream_json(stdout: str) -> List[Dict[str, Any]]:
         except json.JSONDecodeError:
             messages.append({"type": "non_json_line", "text": raw_line})
     return messages
+
+
+def _extract_assistant_texts(messages: List[Dict[str, Any]]) -> List[str]:
+    texts: List[str] = []
+    for event in messages:
+        if not isinstance(event, dict) or event.get("type") != "assistant":
+            continue
+        message = event.get("message")
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            continue
+        content = message.get("content")
+        if isinstance(content, str):
+            if content.strip():
+                texts.append(content)
+            continue
+        if not isinstance(content, list):
+            continue
+        parts: List[str] = []
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "text":
+                parts.append(item.get("text") or "")
+        block = "".join(parts)
+        if block.strip():
+            texts.append(block)
+    return texts
 
 
 def _extract_result(messages: List[Dict[str, Any]]) -> Tuple[Optional[str], Optional[str], Optional[str]]:
@@ -782,6 +768,18 @@ def main() -> None:
 
     advanced = parser.add_argument_group("advanced")
     advanced.add_argument(
+        "--agent-messages-mode",
+        choices=["result", "concat"],
+        default="result",
+        help="How to build `agent_messages` in the final JSON. Default: result. NO NEED TO CHANGE THIS unless user requests.",
+    )
+    advanced.add_argument(
+        "--quiet",
+        dest="quiet",
+        action="store_true",
+        help="Disable all stderr output (default: stream Claude assistant text to stderr). NO NEED TO CHANGE THIS unless user requests.",
+    )
+    advanced.add_argument(
         "--step-mode",
         choices=["on", "auto", "off"],
         default=DEFAULT_STEP_MODE,
@@ -837,50 +835,32 @@ def main() -> None:
     advanced.add_argument("--return-all-messages", action="store_true", help="Return the full streamed JSON event list (debugging).")
     advanced.add_argument("--timeout-s", type=float, default=1800.0, help="Timeout in seconds (default: 30 minutes).")
     advanced.add_argument("--claude-bin", default="claude", help="Claude Code executable name/path (default: `claude`).")
-    advanced.add_argument(
-        "--quiet-status",
-        action="store_true",
-        help="Disable minimal runtime status lines on stderr (`working...`, `session_id=...`, `done`).",
-    )
-    advanced.add_argument(
-        "--status-interval-s",
-        type=float,
-        default=DEFAULT_STATUS_INTERVAL_S,
-        help=f"Status heartbeat interval in seconds (default: {DEFAULT_STATUS_INTERVAL_S:g}).",
-    )
 
     args = parser.parse_args()
 
-    status_enabled = not bool(args.quiet_status)
-    status_interval_s = float(args.status_interval_s)
-    if status_interval_s <= 0:
-        status_interval_s = DEFAULT_STATUS_INTERVAL_S
-    last_status_ts = 0.0
+    quiet = bool(args.quiet)
+    stderr_lock = threading.Lock()
     emitted_session_id: Optional[str] = None
-
-    def emit_working(*, force: bool = False) -> None:
-        nonlocal last_status_ts
-        if not status_enabled:
-            return
-        now = time.monotonic()
-        if not force and (now - last_status_ts) < status_interval_s:
-            return
-        print("working...", file=sys.stderr, flush=True)
-        last_status_ts = now
 
     def emit_session_id(session_id: Optional[str]) -> None:
         nonlocal emitted_session_id
-        if not status_enabled or not session_id:
+        if quiet or not session_id:
             return
-        if session_id == emitted_session_id:
-            return
-        print(f"session_id={session_id}", file=sys.stderr, flush=True)
-        emitted_session_id = session_id
+        with stderr_lock:
+            if session_id == emitted_session_id:
+                return
+            print(f"session_id={session_id}", file=sys.stderr, flush=True)
+            emitted_session_id = session_id
 
-    def emit_done() -> None:
-        if not status_enabled:
+    def emit_assistant_text(text: str) -> None:
+        if quiet:
             return
-        print("done", file=sys.stderr, flush=True)
+        normalized = (text or "").rstrip("\n")
+        if not normalized.strip():
+            return
+        with stderr_lock:
+            print(normalized, file=sys.stderr, flush=True)
+            print("", file=sys.stderr, flush=True)
 
     cd_path = Path(args.cd).expanduser()
     if not cd_path.is_dir():
@@ -920,8 +900,30 @@ def main() -> None:
     # Ensure controllable defaults: default to extended thinking ON, but allow opt-out.
     claude_settings[CLAUDE_SETTINGS_ALWAYS_THINKING_KEY] = bool(args.extended_thinking)
 
-    output_format = "stream-json" if args.return_all_messages else "json"
+    output_format = "stream-json"
     verbose = bool(args.return_all_messages)
+
+    if args.SESSION_ID:
+        emit_session_id(args.SESSION_ID)
+
+    def handle_stream_event(event: Dict[str, Any]) -> None:
+        emit_session_id(event.get("session_id"))
+        if event.get("type") != "assistant":
+            return
+        message = event.get("message")
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            return
+        content = message.get("content")
+        if isinstance(content, str):
+            emit_assistant_text(content)
+            return
+        if not isinstance(content, list):
+            return
+        parts: List[str] = []
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "text":
+                parts.append(item.get("text") or "")
+        emit_assistant_text("".join(parts))
 
     def run_one(
         *, run_prompt: str, resume_session_id: str, continue_session: bool, max_turns: Optional[int]
@@ -944,12 +946,10 @@ def main() -> None:
             cmd,
             timeout_s=args.timeout_s,
             cwd=cd_path,
-            heartbeat_interval_s=status_interval_s if status_enabled else None,
-            heartbeat_callback=emit_working if status_enabled else None,
+            stream_json_event_callback=handle_stream_event if not quiet else None,
         )
 
     def print_exec_error(error: Exception) -> None:
-        emit_done()
         print(
             json.dumps(
                 {"success": False, "error": f"Failed to execute Claude Code CLI. Is `claude` installed and on PATH?\n\n{error}"},
@@ -973,18 +973,8 @@ def main() -> None:
               - is_error
               - result_text
               - parse_error (optional)
-            Works for both `--output-format json` and `stream-json`.
+            Works for `--output-format stream-json`.
             """
-            if output_format == "json":
-                payload = _parse_single_json(stdout_text)
-                return {
-                    "session_id": payload.get("session_id"),
-                    "subtype": payload.get("subtype"),
-                    "is_error": bool(payload.get("is_error")),
-                    "result_text": payload.get("result") or "",
-                    "payload": payload,
-                }
-
             messages = _parse_stream_json(stdout_text)
             # Find the last result event.
             last_result: Optional[Dict[str, Any]] = None
@@ -1096,83 +1086,59 @@ def main() -> None:
         # Exceeded max steps.
         return 1, "", f"Step mode exceeded --step-max-steps={args.step_max_steps} without reaching a final result."
 
-    emit_working(force=True)
-    emit_session_id(args.SESSION_ID or None)
-
     rc, stdout, stderr = run_with_optional_stepping()
 
     try:
-        if output_format == "json":
-            payload = _parse_single_json(stdout)
-            session_id = payload.get("session_id")
-            emit_session_id(session_id)
-            result_text = payload.get("result")
-            subtype = payload.get("subtype")
-            is_error = bool(payload.get("is_error"))
-            success = bool(payload.get("type") == "result" and subtype == "success" and not is_error and session_id and result_text)
+        messages = _parse_stream_json(stdout)
+        session_id, result_text, error_text = _extract_result(messages)
+        emit_session_id(session_id)
 
-            if success:
+        assistant_texts = _extract_assistant_texts(messages)
+        if args.agent_messages_mode == "concat":
+            agent_messages = "\n\n".join(assistant_texts).strip()
+            if not agent_messages and result_text:
                 agent_messages = result_text
-                if not args.keep_thinking_blocks and agent_messages is not None:
-                    agent_messages = _strip_thinking_blocks(agent_messages)
-                result: Dict[str, Any] = {
-                    "success": True,
-                    "SESSION_ID": session_id,
-                    "agent_messages": agent_messages,
-                }
-            else:
-                error_bits = []
-                if subtype and subtype != "success":
-                    error_bits.append(f"[claude subtype] {subtype}")
-                if is_error:
-                    error_bits.append("[claude is_error] true")
-                if stderr.strip():
-                    error_bits.append(f"[stderr] {stderr.strip()}")
-                if rc != 0:
-                    error_bits.append(f"[exit_code] {rc}")
-                error_bits.append(f"[stdout] {stdout.strip()}")
-                result = {"success": False, "error": "\n".join(error_bits).strip()}
-                if session_id:
-                    result["SESSION_ID"] = session_id
-
-            if args.return_all_messages:
-                result["all_messages"] = [payload]
-
         else:
-            messages = _parse_stream_json(stdout)
-            session_id, result_text, error_text = _extract_result(messages)
-            emit_session_id(session_id)
-            last_result: Optional[Dict[str, Any]] = next(
-                (msg for msg in reversed(messages) if isinstance(msg, dict) and msg.get("type") == "result"),
-                None,
-            )
-            subtype = (last_result or {}).get("subtype")
-            is_error = bool((last_result or {}).get("is_error"))
-            success = bool(rc == 0 and subtype == "success" and not is_error and session_id and result_text and not error_text)
+            agent_messages = (result_text or "").strip()
 
-            if success:
-                agent_messages = result_text
-                if not args.keep_thinking_blocks and agent_messages is not None:
-                    agent_messages = _strip_thinking_blocks(agent_messages)
-                result = {"success": True, "SESSION_ID": session_id, "agent_messages": agent_messages}
-            else:
-                error_bits = []
-                if subtype and subtype != "success":
-                    error_bits.append(f"[claude subtype] {subtype}")
-                if is_error:
-                    error_bits.append("[claude is_error] true")
-                if error_text:
-                    error_bits.append(f"[claude result] {error_text}")
-                if stderr.strip():
-                    error_bits.append(f"[stderr] {stderr.strip()}")
-                if stdout.strip():
-                    error_bits.append(f"[stdout] {stdout.strip()}")
-                if rc != 0:
-                    error_bits.append(f"[exit_code] {rc}")
-                result = {"success": False, "error": "\n".join(error_bits).strip()}
-                if session_id:
-                    result["SESSION_ID"] = session_id
+        last_result: Optional[Dict[str, Any]] = next(
+            (msg for msg in reversed(messages) if isinstance(msg, dict) and msg.get("type") == "result"),
+            None,
+        )
+        subtype = (last_result or {}).get("subtype")
+        is_error = bool((last_result or {}).get("is_error"))
+        success = bool(
+            rc == 0
+            and subtype == "success"
+            and not is_error
+            and session_id
+            and not error_text
+            and bool(agent_messages)
+        )
 
+        if success:
+            if not args.keep_thinking_blocks:
+                agent_messages = _strip_thinking_blocks(agent_messages)
+            result = {"success": True, "SESSION_ID": session_id, "agent_messages": agent_messages}
+        else:
+            error_bits = []
+            if subtype and subtype != "success":
+                error_bits.append(f"[claude subtype] {subtype}")
+            if is_error:
+                error_bits.append("[claude is_error] true")
+            if error_text:
+                error_bits.append(f"[claude result] {error_text}")
+            if stderr.strip():
+                error_bits.append(f"[stderr] {stderr.strip()}")
+            if stdout.strip():
+                error_bits.append(f"[stdout] {stdout.strip()}")
+            if rc != 0:
+                error_bits.append(f"[exit_code] {rc}")
+            result = {"success": False, "error": "\n".join(error_bits).strip()}
+            if session_id:
+                result["SESSION_ID"] = session_id
+
+        if args.return_all_messages:
             result["all_messages"] = messages
 
     except Exception as error:  # noqa: BLE001 - keep bridge resilient
@@ -1185,7 +1151,6 @@ def main() -> None:
         if extracted_session_id:
             result["SESSION_ID"] = extracted_session_id
 
-    emit_done()
     print(json.dumps(result, indent=2, ensure_ascii=False))
 
 
