@@ -2,7 +2,7 @@
 
 [中文](README.md) | English
 
-A skill for **Codex CLI**: via a JSON bridge script, it delegates tasks such as **code review / debugging / alternative implementation comparisons** to **Anthropic Claude Code CLI** (default model: `claude-opus-4-5-20251101`), and returns results as structured JSON for multi-model collaboration.
+A skill for **Codex CLI**: via a JSON bridge script, it delegates tasks such as **code review / debugging / alternative implementation comparisons** to **Anthropic Claude Code CLI** (default model: `claude-opus-4-6`), and returns results as structured JSON for multi-model collaboration.
 
 The main entry points of this repository are `SKILL.md` (the Codex skill definition) and `scripts/claude_code_bridge.py` (the bridge script).
 

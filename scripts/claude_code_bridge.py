@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 
-DEFAULT_MODEL = "claude-opus-4-5-20251101"
+DEFAULT_MODEL = "claude-opus-4-6"
 DEFAULT_READONLY_TOOLS = "Read,Glob,Grep,LS,Write"
 DEFAULT_FULL_ACCESS_ALLOWED_TOOLS = "*"
 DEFAULT_EXTENDED_THINKING_ENABLED = True
