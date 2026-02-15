@@ -17,6 +17,7 @@
         - 每次仅允许 claude code 做一次 agentic turn （最多仅一次tool call就调用停止）
         - 然后bridge script 会用相同的session_id自动发送很短的继续指令，让它进行下一步
     - 通过这种方法，可以最大限度地兼容通过各类Anthropic-compatible proxy API运行的claude code.
+3. 将claude code的assistant文本实时输出到stderr，便于用户以及codex实时跟踪查看进度。
 
 ## 安装到 `~/.codex/skills/`
 

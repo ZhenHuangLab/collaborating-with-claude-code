@@ -17,6 +17,7 @@ Compared to other similar skills / collaboration workflows, this skill has the f
         - Each iteration allows Claude Code to perform only a single agentic turn (at most one tool call, then stop).
         - Then the bridge script automatically sends a short “continue” instruction using the same `session_id` to let it proceed to the next step.
     - This approach maximizes compatibility when running Claude Code via various Anthropic-compatible proxy APIs.
+3. It streams Claude Code's assistant text to `stderr` in real-time, making it easier for users and Codex to track progress.
 
 ## Install to `~/.codex/skills/`
 
