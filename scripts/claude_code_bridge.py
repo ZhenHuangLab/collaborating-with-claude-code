@@ -8,6 +8,7 @@ envelope suitable for multi-model collaboration.
 from __future__ import annotations
 
 import argparse
+import codecs
 import json
 import os
 import signal
@@ -21,7 +22,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 
 DEFAULT_MODEL = "claude-opus-4-5-20251101"
-DEFAULT_READONLY_TOOLS = "Read,Glob,Grep,LS"
+DEFAULT_READONLY_TOOLS = "Read,Glob,Grep,LS,Write"
 DEFAULT_FULL_ACCESS_ALLOWED_TOOLS = "*"
 DEFAULT_EXTENDED_THINKING_ENABLED = True
 CLAUDE_SETTINGS_ALWAYS_THINKING_KEY = "alwaysThinkingEnabled"
@@ -36,6 +37,7 @@ PIPE_DRAIN_GRACE_S = 2.0
 TERMINATE_GRACE_S = 5.0
 EARLY_PARSE_INTERVAL_S = 1.0
 EARLY_PARSE_QUIET_S = 0.5
+IO_READ_CHUNK_SIZE = 8192
 
 
 def _kill_process_tree(process: subprocess.Popen[Any], *, force: bool) -> None:
@@ -471,9 +473,6 @@ def _run(
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        universal_newlines=True,
-        encoding="utf-8",
-        errors="replace",
         env=env,
         cwd=str(cwd) if cwd is not None else None,
         **popen_kwargs,
@@ -485,15 +484,23 @@ def _run(
     def drain(stream: Any, sink: _OutputBuffer) -> None:
         if stream is None:
             return
+        decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
         try:
             while True:
-                chunk = stream.readline()
-                if chunk == "":
+                chunk = stream.read(IO_READ_CHUNK_SIZE)
+                if not chunk:
                     break
-                sink.append(chunk)
+                if isinstance(chunk, str):
+                    sink.append(chunk)
+                else:
+                    sink.append(decoder.decode(chunk))
         except Exception as error:  # noqa: BLE001 - keep bridge resilient
             sink.append(f"\n[bridge] stream read error: {error}\n")
         finally:
+            try:
+                sink.append(decoder.decode(b"", final=True))
+            except Exception:
+                pass
             try:
                 stream.close()
             except Exception:
@@ -513,6 +520,8 @@ def _run(
     last_parse_attempt_ts = 0.0
     timed_out = False
     completed_early = False
+    completed_stdout: Optional[str] = None
+    completed_stderr: Optional[str] = None
 
     output_format: Optional[str] = None
     try:
@@ -524,9 +533,6 @@ def _run(
 
     try:
         while True:
-            if process.poll() is not None:
-                break
-
             now = time.monotonic()
             if deadline is not None and now >= deadline:
                 timed_out = True
@@ -541,10 +547,17 @@ def _run(
                 )
                 if should_try_parse:
                     last_parse_attempt_ts = now
-                    parsed = _try_parse_json_value(stdout_buf.snapshot())
+                    parsed_stdout = stdout_buf.snapshot()
+                    parsed = _try_parse_json_value(parsed_stdout)
                     if parsed is not None and _has_result_event(parsed):
                         completed_early = True
+                        completed_stdout = parsed_stdout
+                        completed_stderr = stderr_buf.snapshot()
                         break
+
+            process_exited = process.poll() is not None
+            if process_exited and (not t_out.is_alive()) and (not t_err.is_alive()):
+                break
 
             if (
                 heartbeat_callback is not None
@@ -583,11 +596,17 @@ def _run(
             t_out.join(timeout=PIPE_DRAIN_GRACE_S)
             t_err.join(timeout=PIPE_DRAIN_GRACE_S)
 
-    stdout = stdout_buf.snapshot()
-    stderr = stderr_buf.snapshot()
+    stdout = completed_stdout if completed_early and completed_stdout is not None else stdout_buf.snapshot()
+    stderr = completed_stderr if completed_early and completed_stderr is not None else stderr_buf.snapshot()
 
     if timed_out:
-        stderr = (stderr + "\n[timeout] Claude Code process timed out.").strip()
+        stdout_tail = stdout_buf.tail().strip()
+        stderr = (
+            stderr
+            + "\n[timeout] Claude Code process timed out."
+            + (f" stdout_chars={len(stdout)} stderr_chars={len(stderr)}" if stdout or stderr else "")
+            + (f" stdout_tail={stdout_tail[-200:]}" if stdout_tail else "")
+        ).strip()
         return 124, stdout, stderr
 
     if completed_early:
