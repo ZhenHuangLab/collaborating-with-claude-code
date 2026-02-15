@@ -78,7 +78,7 @@ python <script_loc> --no-full-access --cd "/path/to/repo" --PROMPT "Review the a
 
 ## 兼容性
 
-已经在codex v0.87, claude code v2.1.11 and v2.1.12 测试通过.
+已经在codex v0.87, v0.98, v0.101.0, claude code v2.1.11, v2.1.12, v2.1.25 测试通过.
 
 ## License
 
